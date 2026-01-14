@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Research Finder CLI - A tool to research topics or questions using Perplexity's Sonar API.
+Supports organization-specific research and batch processing of CSV files.
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -199,6 +201,77 @@ class ResearchAssistant:
             return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
+def process_csv_file(csv_file_path: str, column_name: str, assistant: ResearchAssistant,
+                    orgname: Optional[str] = None, model: str = ResearchAssistant.DEFAULT_MODEL) -> None:
+    """
+    Process a CSV file by researching each row's specified column and appending results.
+
+    Args:
+        csv_file_path: Path to the CSV file
+        column_name: Name of the column containing queries
+        assistant: ResearchAssistant instance
+        orgname: Optional organization name to include in queries
+        model: Perplexity model to use
+    """
+    try:
+        # Read the CSV file
+        with open(csv_file_path, 'r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            rows = list(reader)
+
+        if not rows:
+            print("Error: CSV file is empty or has no data rows.", file=sys.stderr)
+            return
+
+        # Check if the specified column exists
+        if column_name not in rows[0]:
+            print(f"Error: Column '{column_name}' not found in CSV file. Available columns: {list(rows[0].keys())}", file=sys.stderr)
+            return
+
+        # Process each row
+        processed_rows = []
+        total_rows = len(rows)
+
+        for i, row in enumerate(rows, 1):
+            query_text = row[column_name].strip()
+            if not query_text:
+                print(f"Warning: Row {i} has empty {column_name}, skipping.", file=sys.stderr)
+                row['research_results'] = json.dumps({"error": "Empty query"})
+                processed_rows.append(row)
+                continue
+
+            # Construct the research query
+            research_query = query_text
+            if orgname:
+                research_query = f"{orgname} {query_text}"
+
+            print(f"Processing row {i}/{total_rows}: {research_query}", file=sys.stderr)
+
+            # Perform research
+            results = assistant.research_topic(research_query, model=model)
+
+            # Add results as JSON string to the row
+            row['research_results'] = json.dumps(results)
+            processed_rows.append(row)
+
+        # Write back to CSV with new column
+        output_file = csv_file_path.rsplit('.', 1)[0] + '_with_results.csv'
+
+        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            if processed_rows:
+                fieldnames = list(processed_rows[0].keys())
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(processed_rows)
+
+        print(f"\n✅ CSV processing complete! Results saved to: {output_file}", file=sys.stderr)
+
+    except FileNotFoundError:
+        print(f"Error: CSV file not found: {csv_file_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error processing CSV file: {str(e)}", file=sys.stderr)
+
+
 def display_results(results: Dict[str, Any], output_json: bool = False):
     """
     Display the research results in a human-readable format or as JSON.
@@ -252,13 +325,14 @@ def display_results(results: Dict[str, Any], output_json: bool = False):
 def main():
     """Main entry point for the research finder CLI."""
     parser = argparse.ArgumentParser(
-        description="Research Finder CLI - Research topics using Perplexity Sonar API"
+        description="Research Finder CLI - Research topics using Perplexity Sonar API. Supports organization-specific queries and CSV batch processing."
     )
 
     parser.add_argument(
         "query",
         type=str,
-        help="The research question or topic to investigate."
+        nargs='?',
+        help="The research question or topic to investigate. Not required when using --csv-file."
     )
     parser.add_argument(
         "-m",
@@ -285,16 +359,53 @@ def main():
         action="store_true",
         help="Output results as JSON instead of human-readable format."
     )
+    parser.add_argument(
+        "--orgname",
+        type=str,
+        help="Organization name to include in the research query."
+    )
+    parser.add_argument(
+        "--csv-file",
+        type=str,
+        help="Path to CSV file to process. If provided, will process each row using the specified column."
+    )
+    parser.add_argument(
+        "--column",
+        type=str,
+        help="Column name in CSV file containing the queries to research. Required when using --csv-file."
+    )
 
     args = parser.parse_args()
 
+    # Validate arguments
+    if args.csv_file and not args.column:
+        print("Error: --column is required when using --csv-file", file=sys.stderr)
+        sys.exit(1)
+    if args.column and not args.csv_file:
+        print("Error: --csv-file is required when using --column", file=sys.stderr)
+        sys.exit(1)
+    if not args.csv_file and not args.query:
+        print("Error: Either provide a query as a positional argument or use --csv-file with --column", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        print(f"Initializing research assistant for query: \"{args.query}\"", file=sys.stderr)
+        print("Initializing research assistant...", file=sys.stderr)
         assistant = ResearchAssistant(api_key=args.api_key, prompt_file=args.prompt_file)
 
-        print("Researching in progress...", file=sys.stderr)
-        results = assistant.research_topic(args.query, model=args.model)
-        display_results(results, output_json=args.json)
+        if args.csv_file:
+            # CSV processing mode
+            print(f"Processing CSV file: {args.csv_file} using column: {args.column}", file=sys.stderr)
+            process_csv_file(args.csv_file, args.column, assistant, args.orgname, args.model)
+        else:
+            # Single query mode
+            research_query = args.query
+            if args.orgname:
+                research_query = f"{args.orgname} {args.query}"
+
+            print(f"Researching query: \"{research_query}\"", file=sys.stderr)
+            print("Researching in progress...", file=sys.stderr)
+            results = assistant.research_topic(research_query, model=args.model)
+            display_results(results, output_json=args.json)
 
     except ValueError as e: # Catch API key error specifically
         print(f"Configuration Error: {e}", file=sys.stderr)
