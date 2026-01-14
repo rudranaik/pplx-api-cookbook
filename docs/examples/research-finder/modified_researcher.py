@@ -9,6 +9,8 @@ import csv
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional, Any, List
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ class ResearchAssistant:
     """A class to interact with Perplexity Sonar API for research."""
 
     API_URL = "https://api.perplexity.ai/chat/completions"
-    DEFAULT_MODEL = "sonar" # Using sonar-pro for potentially better research capabilities
+    DEFAULT_MODEL = "sonar-pro" # Using sonar-pro for potentially better research capabilities
     PROMPT_FILE = "system_prompt.md"
 
     def __init__(self, api_key: Optional[str] = None, prompt_file: Optional[str] = None):
@@ -98,7 +100,7 @@ class ResearchAssistant:
         print("Using fallback default system prompt.", file=sys.stderr)
         return (
             "You are an AI equity research assistant. Your task is to research the user's query, "
-            "provide a concise summary in 300 words or less, as a markdown file, and list the sources used."
+            "provide a concise summary in 300 words or less and list the sources used."
         )
 
     def research_topic(self, query: str, model: str = DEFAULT_MODEL) -> Dict[str, Any]:
@@ -129,10 +131,7 @@ class ResearchAssistant:
             ]
             # Add other parameters like temperature, max_tokens if needed
             ,"temperature": 0,
-            # "max_tokens": 512,
-            "web_search_options": {
-                "search_domain_filter": ["https://www.kirloskaroilengines.com/investors"]
-            }
+            # "max_tokens": 512
         }
 
         try:
@@ -202,7 +201,8 @@ class ResearchAssistant:
 
 
 def process_csv_file(csv_file_path: str, column_name: str, assistant: ResearchAssistant,
-                    orgname: Optional[str] = None, model: str = ResearchAssistant.DEFAULT_MODEL) -> None:
+                    orgname: Optional[str] = None, model: str = ResearchAssistant.DEFAULT_MODEL,
+                    max_concurrent_calls: int = 5) -> None:
     """
     Process a CSV file by researching each row's specified column and appending results.
 
@@ -228,48 +228,120 @@ def process_csv_file(csv_file_path: str, column_name: str, assistant: ResearchAs
             print(f"Error: Column '{column_name}' not found in CSV file. Available columns: {list(rows[0].keys())}", file=sys.stderr)
             return
 
-        # Process each row
-        processed_rows = []
-        total_rows = len(rows)
+        # Set up output CSV file
+        output_file = csv_file_path.rsplit('.', 1)[0] + '_with_results.csv'
+        fieldnames = list(rows[0].keys()) + ['research_results']
 
-        for i, row in enumerate(rows, 1):
+        # Initialize CSV file with header
+        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+        # Process rows in parallel with immediate writing
+        total_rows = len(rows)
+        completed_rows = {}  # Store completed rows by index
+        next_write_idx = 0  # Next row index to write
+        write_lock = threading.Lock()  # Thread-safe writing
+
+        def process_single_row(row_idx: int, row: Dict[str, Any]) -> None:
+            """Process a single CSV row and write result immediately if possible."""
+            nonlocal next_write_idx
+
             query_text = row[column_name].strip()
             if not query_text:
-                print(f"Warning: Row {i} has empty {column_name}, skipping.", file=sys.stderr)
-                row['research_results'] = json.dumps({"error": "Empty query"})
-                processed_rows.append(row)
-                continue
+                print(f"Warning: Row {row_idx + 1} has empty {column_name}, skipping.", file=sys.stderr)
+                row_copy = row.copy()
+                row_copy['research_results'] = format_results_text({"error": "Empty query"})
+                completed_rows[row_idx] = row_copy
+            else:
+                # Construct the research query
+                research_query = query_text
+                if orgname:
+                    research_query = f"For the organization: {orgname}, answer this query only using reputed sources such as the company's website, annual reports, press releases, and other credible sources. Query: {query_text}"
 
-            # Construct the research query
-            research_query = query_text
-            if orgname:
-                research_query = f"{orgname} {query_text}"
+                print(f"Processing row {row_idx + 1}/{total_rows}: {research_query}", file=sys.stderr)
 
-            print(f"Processing row {i}/{total_rows}: {research_query}", file=sys.stderr)
+                # Perform research
+                results = assistant.research_topic(research_query, model=model)
 
-            # Perform research
-            results = assistant.research_topic(research_query, model=model)
+                # Add results as formatted text to the row
+                row_copy = row.copy()
+                row_copy['research_results'] = format_results_text(results)
+                completed_rows[row_idx] = row_copy
 
-            # Add results as JSON string to the row
-            row['research_results'] = json.dumps(results)
-            processed_rows.append(row)
+            # Check if we can write consecutive rows starting from next_write_idx
+            with write_lock:
+                while next_write_idx in completed_rows:
+                    row_to_write = completed_rows[next_write_idx]
+                    with open(output_file, 'a', newline='', encoding='utf-8') as csvfile:
+                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                        writer.writerow(row_to_write)
+                    print(f"✓ Row {next_write_idx + 1}/{total_rows} result saved to CSV", file=sys.stderr)
+                    del completed_rows[next_write_idx]
+                    next_write_idx += 1
 
-        # Write back to CSV with new column
-        output_file = csv_file_path.rsplit('.', 1)[0] + '_with_results.csv'
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=max_concurrent_calls) as executor:
+            # Submit all tasks
+            futures = [executor.submit(process_single_row, i, row) for i, row in enumerate(rows)]
 
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            if processed_rows:
-                fieldnames = list(processed_rows[0].keys())
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(processed_rows)
+            # Wait for all tasks to complete
+            for future in as_completed(futures):
+                future.result()  # This will raise any exceptions that occurred
 
-        print(f"\n✅ CSV processing complete! Results saved to: {output_file}", file=sys.stderr)
+        print(f"\n✅ CSV processing complete! All results saved to: {output_file}", file=sys.stderr)
 
     except FileNotFoundError:
         print(f"Error: CSV file not found: {csv_file_path}", file=sys.stderr)
     except Exception as e:
         print(f"Error processing CSV file: {str(e)}", file=sys.stderr)
+
+
+def format_results_text(results: Dict[str, Any]) -> str:
+    """
+    Format research results as clean, readable text (for CSV storage).
+
+    Args:
+        results: The research results dictionary.
+
+    Returns:
+        A formatted text string of the results.
+    """
+    lines = []
+
+    if "error" in results:
+        lines.append(f"❌ Error: {results['error']}")
+        if "raw_response" in results:
+            lines.append("\n📄 Raw Response Snippet:")
+            raw_response_str = json.dumps(results["raw_response"]) if isinstance(results["raw_response"], dict) else str(results["raw_response"])
+            lines.append(raw_response_str[:500] + ("..." if len(raw_response_str) > 500 else ""))
+        return "\n".join(lines)
+
+    lines.append(results.get("summary", "No summary provided."))
+
+    sources = results.get("sources")
+    if sources:
+        lines.append("\n SOURCES:")
+        if isinstance(sources, list):
+            for i, source in enumerate(sources, 1):
+                 if isinstance(source, dict):
+                     title = source.get('title', 'No Title')
+                     url = source.get('url', '')
+                     lines.append(f"  {i}. {title}{(' (' + url + ')') if url else ''}")
+                 elif isinstance(source, str):
+                     lines.append(f"  {i}. {source}")
+                 else:
+                     lines.append(f"  {i}. {str(source)}")
+        else:
+            lines.append(f"  {sources}")
+    else:
+        lines.append("\n🔗 SOURCES: No sources were explicitly listed or extracted.")
+        if "raw_response" in results:
+             lines.append("(Check raw response below for potential sources within the text)")
+             lines.append("\n📄 Raw Response:")
+             lines.append(results["raw_response"])
+
+    return "\n".join(lines)
 
 
 def display_results(results: Dict[str, Any], output_json: bool = False):
@@ -284,42 +356,8 @@ def display_results(results: Dict[str, Any], output_json: bool = False):
         print(json.dumps(results, indent=2))
         return
 
-    if "error" in results:
-        print(f"\n❌ Error: {results['error']}")
-        if "raw_response" in results:
-            print("\n📄 Raw Response Snippet:")
-            # Safely convert raw_response to string before slicing
-            raw_response_str = json.dumps(results["raw_response"]) if isinstance(results["raw_response"], dict) else str(results["raw_response"])
-            print(raw_response_str[:500] + ("..." if len(raw_response_str) > 500 else ""))
-        return
-
-    print("\n✅ Research Complete!")
-    print("\n📝 SUMMARY:")
-    print(results.get("summary", "No summary provided."))
-
-    sources = results.get("sources")
-    if sources:
-        print("\n🔗 SOURCES:")
-        if isinstance(sources, list):
-            for i, source in enumerate(sources, 1):
-                 # Check if source is a dict (like from structured citations) or just a string/url
-                 if isinstance(source, dict):
-                     title = source.get('title', 'No Title')
-                     url = source.get('url', '')
-                     print(f"  {i}. {title}{(' (' + url + ')') if url else ''}")
-                 elif isinstance(source, str):
-                     print(f"  {i}. {source}")
-                 else:
-                     print(f"  {i}. {str(source)}") # Fallback for unexpected source format
-        else:
-            # Handle case where sources might not be a list (though API usually returns list)
-             print(f"  {sources}")
-    else:
-        print("\n🔗 SOURCES: No sources were explicitly listed or extracted.")
-        if "raw_response" in results:
-             print("(Check raw response below for potential sources within the text)")
-             print("\n📄 Raw Response:")
-             print(results["raw_response"])
+    # Use the text formatting function to display results
+    print(format_results_text(results))
 
 
 def main():
@@ -374,6 +412,12 @@ def main():
         type=str,
         help="Column name in CSV file containing the queries to research. Required when using --csv-file."
     )
+    parser.add_argument(
+        "--ncall",
+        type=int,
+        default=5,
+        help="Number of parallel API calls to make when processing CSV (default: 5)."
+    )
 
     args = parser.parse_args()
 
@@ -394,13 +438,13 @@ def main():
 
         if args.csv_file:
             # CSV processing mode
-            print(f"Processing CSV file: {args.csv_file} using column: {args.column}", file=sys.stderr)
-            process_csv_file(args.csv_file, args.column, assistant, args.orgname, args.model)
+            print(f"Processing CSV file: {args.csv_file} using column: {args.column} with {args.ncall} parallel calls", file=sys.stderr)
+            process_csv_file(args.csv_file, args.column, assistant, args.orgname, args.model, args.ncall)
         else:
             # Single query mode
             research_query = args.query
             if args.orgname:
-                research_query = f"{args.orgname} {args.query}"
+                research_query = f"For the organization: {args.orgname}, answer this query only using reputed sources such as the company's website, annual reports, press releases, and other credible sources. Query: {args.query}"
 
             print(f"Researching query: \"{research_query}\"", file=sys.stderr)
             print("Researching in progress...", file=sys.stderr)
