@@ -229,7 +229,7 @@ def process_csv_file(csv_file_path: str, column_name: str, assistant: ResearchAs
             return
 
         # Set up output CSV file
-        output_file = csv_file_path.rsplit('.', 1)[0] + '_with_results.csv'
+        output_file = csv_file_path.rsplit('.', 1)[0] + '_with_results_2.csv'
         fieldnames = list(rows[0].keys()) + ['research_results']
 
         # Initialize CSV file with header
